@@ -1,0 +1,311 @@
+---
+title: "Crime Rate Prediction Analysis"
+author: "Ilaha Musayeva"
+date: "10.25.2023"
+---
+
+## Library Imports
+
+
+```{r}
+library(tidyverse)      # Data manipulation and visualization
+library(data.table)     # Efficient data manipulation
+library(skimr)          # Data summary statistics
+library(rstudioapi)     # RStudio API for interactions with RStudio
+library(inspectdf)      # DataFrame inspection
+library(mice)           # Imputation of missing values
+library(plotly)         # Interactive plots
+library(highcharter)    # Highcharts for R
+library(recipes)        # Preprocessing of data
+library(caret)          # Classification and regression training
+library(purrr)          # Functional programming
+library(graphics)       # Base R graphics
+library(Hmisc)          # Miscellaneous functions
+library(glue)           # String manipulation
+
+library(h2o)            # H2O.ai for machine learning
+```
+
+## Data Loading and Exploration
+```{r}
+# Load the raw data
+raw <- fread("crimes.csv")
+
+# Display a glimpse of the data
+raw %>% glimpse()
+
+# Check for missing values
+raw %>% inspect_na()
+
+# View the entire dataset
+View(raw)
+
+# Extract numeric variable names
+num_vars <- raw %>% select_if(is.numeric) %>% names()
+
+# Display outliers for numeric variables
+for (b in num_vars) {
+  OutVals <- boxplot(raw[[b]])$out
+  if (length(OutVals) > 0) {
+    print(paste0("----", b))
+    print(OutVals)
+  }
+}
+
+```
+## Outlier Handling
+```{r}
+# Define columns to process
+columns_to_process <- c(
+  "PctEmplProfServ", "PctOccupManu", "PctOccupMgmtProf", "MalePctDivorce",
+  "MalePctNevMarr", "PctFam2Par", "PersPerFam", "PctKids2Par",
+  "PctYoungKids2Par", "PctTeen2Par", "PctWorkMomYoungKids", "PctWorkMom",
+  "NumIlleg", "PctIlleg", "PctImmigRecent", "ViolentCrimesPerPop"
+)
+
+# Create a copy of the raw data
+raw_no_outliers <- raw  
+
+# Handle outliers using IQR method
+for (col_name in columns_to_process) {
+  OutVals <- boxplot(raw[[col_name]])$out
+  median <- median(raw[[col_name]])
+  
+  o3 <- ifelse(OutVals > median, OutVals, NA) %>% na.omit() %>% as.matrix() %>% t() %>% .[1,]
+  o1 <- ifelse(OutVals < median, OutVals, NA) %>% na.omit() %>% as.matrix() %>% t() %>% .[1,]
+  
+  val <- quantile(raw[[col_name]], 0.75) + 1.5 * IQR(raw[[col_name]])
+  raw[which(raw[[col_name]] %in% o3), col_name] <- val
+  
+  val <- quantile(raw[[col_name]], 0.25) - 1.5 * IQR(raw[[col_name]])
+  raw[which(raw[[col_name]] %in% o1), col_name] <- val
+}
+
+# Combine the original and processed data
+data <- rbind(raw, raw_no_outliers)
+```
+## Model Training
+```{r}
+# Specify target and feature variables
+target <- "ViolentCrimesPerPop"
+features <- data %>% select(-ViolentCrimesPerPop) %>% names()
+
+# Create a formula for the model
+f <- as.formula(paste(target, paste(features, collapse=" + "), sep=" ~ "))
+
+# Fit a linear regression model using base R
+glm <- glm(f, data = data)
+
+# Display summary statistics of the model
+glm %>% summary()
+
+# Check and handle multicollinearity using VIF
+library(faraway)
+while(glm %>% faraway::vif() %>% sort(decreasing=T) %>% .[1] >= 1.5) {
+  afterVIF <- glm %>% faraway::vif() %>% sort(decreasing=T) %>% .[-1] %>% names()
+  f <- as.formula(paste(target, paste(afterVIF, collapse=" + "), sep=" ~ "))
+  glm <- glm(f, data = data)
+}
+```
+## H2O.ai Model Training
+```{r}
+# Initialize H2O
+h2o.init()
+
+# Convert the data to H2O format
+h2o_data <- data %>% as.h2o()
+
+# Split the data into training and testing sets
+h2o_data <- h2o_data %>% h2o.splitFrame(seed = 123, ratios = 0.7)
+train <- h2o_data[[1]]
+test <- h2o_data[[2]]
+
+# Fit a generalized linear model using H2O.ai
+model <- h2o.glm(
+  x = features, y = target,
+  training_frame = train,
+  validation_frame = test,
+  seed = 123, nfolds = 10,
+  lambda = 0, compute_p_values = TRUE
+)
+
+# Display coefficients and p-values
+model@model$coefficients_table %>%
+  as.data.frame() %>%
+  dplyr::select(names, p_value) %>%
+  mutate(p_value = round(p_value, 3)) %>%
+  .[-1,] %>%
+  arrange(desc(p_value))
+
+# Remove features with high p-values
+while (model@model$coefficients_table %>%
+      as.data.frame() %>%
+      dplyr::select(names, p_value) %>%
+      mutate(p_value = round(p_value, 3)) %>%
+      arrange(desc(p_value)) %>%
+      .[1, 2] > 0.05) {
+  model@model$coefficients_table %>%
+    as.data.frame() %>%
+    dplyr::select(names, p_value) %>%
+    mutate(p_value = round(p_value, 3)) %>%
+    filter(!is.nan(p_value)) %>%
+    .[-1,] %>%
+    arrange(desc(p_value)) %>%
+    .[1, 1] -> v
+  features <- features[features != v]
+  train <- train %>% as.data.frame() %>% select(target, features) %>% as.h2o()
+  test <- test %>% as.data.frame() %>% select(target, features) %>% as.h2o()
+  model <- h2o.glm(
+    x = features, y = target,
+    training_frame = train,
+    validation_frame = test,
+    nfolds = 10, seed = 123,
+    lambda = 0, compute_p_values = TRUE
+  )
+}
+
+# Display final coefficients and p-values
+model@model$coefficients_table %>%
+  as.data.frame() %>%
+  dplyr::select(names, p_value) %>%
+  mutate(p_value = round(p_value, 3))
+```
+## Model Evaluation
+```{r}
+# Predict on the test set
+# Predict on the test data using the trained model
+y_pred <- model %>% h2o.predict(newdata = test) %>% as.data.frame()
+
+# Extract the predicted values
+y_pred$predict
+
+# Convert the test set to a data frame
+test_set <- test %>% as.data.frame()
+
+# Calculate residuals (difference between observed and predicted values)
+residuals <- test_set$ViolentCrimesPerPop - y_pred$predict
+
+# Calculate Root Mean Squared Error (RMSE)
+RMSE = sqrt(mean(residuals^2))
+RMSE
+
+# Calculate mean of the observed values in the test set
+y_test_mean = mean(test_set$ViolentCrimesPerPop)
+
+# Calculate Total Sum of Squares (TSS) and Residual Sum of Squares (RSS)
+tss = sum((test_set$ViolentCrimesPerPop - y_test_mean)^2)
+rss = sum(residuals^2)
+
+# Calculate R-squared (coefficient of determination)
+R2 = 1 - (rss/tss)
+R2
+
+# Obtain sample size and number of independent variables
+n <- test_set %>% nrow() # sample size
+k <- features %>% length() # number of independent variables
+
+# Calculate Adjusted R-squared
+Adjusted_R2 = 1 - (1 - R2) * ((n - 1) / (n - k - 1))
+
+# Create a tibble with RMSE, R2, and Adjusted R2
+tibble(RMSE = round(RMSE, 1),
+       R2, Adjusted_R2)
+
+# Combine predicted and observed values into a data frame
+my_data <- cbind(predicted = y_pred$predict,
+                 observed = test_set$ViolentCrimesPerPop) %>% as.data.frame()
+
+# Create a scatter plot with a regression line
+g <- my_data %>%
+  ggplot(aes(predicted, observed)) +
+  geom_point(color = "red") +
+  geom_smooth(method = lm) +
+  labs(x = "Predicted Crime rate",
+       y = "Observed Crime rate",
+       title = glue('Test: Adjusted R2 = {round(enexpr(Adjusted_R2), 2)}')) +
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+# Convert ggplot to plotly
+g %>% ggplotly()
+
+```
+
+## Train Set Evaluation and Visualization
+```{r}
+# Make predictions on the train set.
+y_pred_train <- model %>% h2o.predict(newdata = train) %>% as.data.frame()
+
+# Extract the train set as a data frame.
+train_set <- train %>% as.data.frame()
+
+# Calculate residuals and Root Mean Squared Error (RMSE) for the train set.
+residuals <- train_set$ViolentCrimesPerPop - y_pred_train$predict
+RMSE_train = sqrt(mean(residuals^2))
+
+# Calculate the mean of the target variable in the train set.
+y_train_mean = mean(train_set$ViolentCrimesPerPop)
+
+# Calculate Total Sum of Squares (tss) and Residual Sum of Squares (rss).
+tss = sum((train_set$ViolentCrimesPerPop - y_train_mean)^2)
+rss = sum(residuals^2)
+
+# Calculate R-squared (R2) for the train set.
+R2_train = 1 - (rss/tss)
+
+# Calculate Adjusted R-squared for the train set.
+n <- train_set %>% nrow()
+k <- features %>% length()
+Adjusted_R2_train = 1 - (1 - R2_train) * ((n - 1) / (n - k - 1))
+
+# Create a data frame with predicted and observed values for the train set.
+my_data_train <- cbind(predicted = y_pred_train$predict, observed = train_set$ViolentCrimesPerPop) %>% 
+  as.data.frame()  
+
+# Create a scatter plot with regression line for the train set.
+g_train <- my_data_train %>% 
+  ggplot(aes(predicted, observed)) + 
+  geom_point(color = "darkred") + 
+  geom_smooth(method = lm) + 
+  labs(x = "Predicted Crime rate", 
+       y = "Observed Crime rate",
+       title = glue('Train Set Evaluation: Adjusted R2 = {round(Adjusted_R2_train, 2)}')) +
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12), 
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 14), 
+        axis.title.y = element_text(size = 14))  
+
+# Convert the ggplot to plotly for interactive visualization.
+g_train %>% ggplotly()
+
+# Combine the train set plot with the previous plot (g) using patchwork.
+library(patchwork)
+g_train + g 
+```
+## Final Summary
+```{r}
+# Create a tibble with summary metrics for the train and test sets.
+summary_metrics <- tibble(
+  RMSE_train = round(RMSE_train, 1),
+  RMSE_test = round(RMSE, 1),
+  Adjusted_R2_train,
+  Adjusted_R2_test = Adjusted_R2
+)
+
+# Print the final summary metrics.
+summary_metrics
+```
+
+
+
+
+
+
+
+
+
+
